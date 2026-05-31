@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/Root/">
+    <File Path="AGENTS.md" />
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="RAG-Server/RAG-Server.csproj" />
+</Solution>
