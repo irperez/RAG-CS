@@ -35,10 +35,19 @@ builder.Services.AddSingleton(sp => new RAGQueryService(
     LLM_API_URL, 
     LLM_MODEL));
 builder.Services.AddScoped<IRagIngestionEngine, RagIngestionEngine>();
+builder.Services.AddRazorComponents().AddInteractiveServerComponents();
+builder.Services.AddAuthentication("Scheme").AddCookie("Scheme");
+builder.Services.AddAuthorization();
 builder.Services.AddHostedService<DocumentMonitorService>();
 
 // Build app
 var app = builder.Build();
+
+app.UseStaticFiles();
+app.UseRouting();
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseAntiforgery();
 
 using (var scope = app.Services.CreateScope())
 {
@@ -62,6 +71,9 @@ using (var scope = app.Services.CreateScope())
         app.Logger.LogError(ex, "Failed to initialize Qdrant collection.");
     }
 }
+
+// Blazor routing
+app.MapRazorComponents<RAG_Server.Components.App>().AddInteractiveServerRenderMode();
 
 // API Endpoints
 app.MapPost("/api/ingest", async (IRagIngestionEngine ingestionEngine, 
@@ -103,8 +115,8 @@ app.MapGet("/api/search", async ([FromServices] IRagQueryService ragService,
     }
 });
 
-app.MapGet("/", () => Results.Content(
-   @"<h1>RAG Server API Operational</h1>
+app.MapGet("/api", () => Results.Content(
+    @"<h1>RAG Server API Operational</h1>
 <p>Start Ingestion: <a href='/api/ingest'>/api/ingest</a></p>
 <p>Query RAG System: <a href='/api/search?query=hello'>/api/search?query=hello</a></p>",
     "text/html; charset=utf-8"
