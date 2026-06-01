@@ -16,6 +16,15 @@ public interface IVectorStore
     Task<bool> InitializeCollectionAsync(string collectionName, int vectorDimension, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Deletes all points in the collection matching a given file path.
+    /// </summary>
+    /// <param name="collectionName">The target collection name.</param>
+    /// <param name="fullFilePath">The full filepath to match in the payload.</param>
+    /// <param name="cancellationToken">Token for cancellation.</param>
+    /// <returns>Number of points deleted.</returns>
+    Task<int> DeleteByFilePathAsync(string collectionName, string fullFilePath, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Stores a chunk/document chunk and its associated vector in the database.
     /// </summary>
     /// <param name="collectionName">The target collection name.</param>

@@ -1,12 +1,5 @@
 // Program.cs
-using System;
-using System.Collections.Generic;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using RAG_Server.Services;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -25,7 +18,7 @@ builder.Services.AddSingleton<IFileReader>(sp => new ObsidianFileReader(DOCUMENT
 builder.Services.AddSingleton<IEmbeddingGenerator>(sp => new OllamaEmbeddingGenerator(
     sp.GetRequiredService<HttpClient>(), 
     config["Ollama:Url"] ?? "http://localhost:11434", 
-    config["Embedding:Model"] ?? "all-MiniLM-L6-v2"));
+    config["Embedding:Model"] ?? "locusai/all-minilm-l6-v2"));
 builder.Services.AddSingleton<IVectorStore>(sp => new QdrantVectorStore(qdrantUrl, collectionName));
 builder.Services.AddSingleton(sp => new RAGQueryService(
     sp.GetRequiredService<IEmbeddingGenerator>(), 
@@ -35,6 +28,7 @@ builder.Services.AddSingleton(sp => new RAGQueryService(
     LLM_API_URL, 
     LLM_MODEL));
 builder.Services.AddScoped<IRagIngestionEngine, RagIngestionEngine>();
+builder.Services.AddHttpClient();
 builder.Services.AddRazorComponents().AddInteractiveServerComponents();
 builder.Services.AddAuthentication("Scheme").AddCookie("Scheme");
 builder.Services.AddAuthorization();

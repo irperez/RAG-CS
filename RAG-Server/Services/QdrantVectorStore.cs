@@ -1,16 +1,32 @@
 // QdrantVectorStore.cs
 using Qdrant.Client;
 using Qdrant.Client.Grpc;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace RAG_Server.Services;
 
 /// <summary>
-/// Handles all persistent storage interactions with the Qdrant vector database.
+/// Handles all persistent storage and retrieval interactions with a Qdrant vector database collection.
 /// </summary>
+/// <remarks>
+/// <para><strong>Primary use in this project:</strong> <see cref="RagIngestionEngine"/> uses this class
+/// exclusively to upsert embedding vectors and to delete existing chunks by file path before rebuilding.</para>
+/// <para><strong>Deduplication strategy:</strong> The engine maintains consistency by using the
+/// <c>full_filepath</c> payload field as a unique identifier for all chunks belonging to a single
+/// source file. Before upserting new chunks, <see cref="DeleteByFilePathAsync"/> is called to purge
+/// all points matching that path. This means every source file has exactly one set of vectors in
+/// Qdrant at any given time.</para>
+/// <para><strong>DeleteByFilePathAsync implementation detail:</strong> This method MUST use a
+/// payload-based <see cref="ScrollAsync"/> query with a <see cref="Filter"/> / <see cref="Condition"/>
+/// / <see cref="FieldCondition"/> / <see cref="Match"/> structure targeting the <c>full_filepath</c>
+/// field. <em>Never</em> use <see cref="SearchAsync"/> or <see cref="QdrantClient.SearchAsync"/> to
+/// find points for deletion — Search requires a valid vector (non-zero dimension) which you cannot
+/// provide when performing identification-only deletion. Scroll with a payload filter is the only
+/// correct approach.</para>
+/// <para><strong>UpsertVectorAsync:</strong> Assigns a random <see cref="Guid"/> as the Qdrant point ID
+/// and stores all metadata as string-typed payload values. The <c>full_filepath</c> payload value is
+/// resolved via <see cref="Path.GetFullPath"/> — callers must pass the same absolute path here and to
+/// <see cref="DeleteByFilePathAsync"/> for deduplication to work correctly.</para>
+/// </remarks>
 public class QdrantVectorStore : IVectorStore
 {
     private readonly QdrantClient _client;
@@ -50,6 +66,64 @@ public class QdrantVectorStore : IVectorStore
         catch (System.Exception ex)
         {
             System.Console.WriteLine($"[Qdrant] Error initializing collection '{collectionName}': {ex.Message}");
+            throw;
+        }
+    }
+
+    public async Task<int> DeleteByFilePathAsync(string collectionName, string fullFilePath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var filter = new Qdrant.Client.Grpc.Filter();
+            filter.Must.Add(new Qdrant.Client.Grpc.Condition
+            {
+                Field = new Qdrant.Client.Grpc.FieldCondition
+                {
+                    Key = "full_filepath",
+                    Match = new Qdrant.Client.Grpc.Match { Keyword = fullFilePath }
+                }
+            });
+
+            var allPoints = new List<Qdrant.Client.Grpc.RetrievedPoint>();
+            Qdrant.Client.Grpc.PointId? offset = null;
+
+            do
+            {
+                var result = await _client.ScrollAsync(
+                    collectionName,
+                    filter: filter,
+                    limit: 1000,
+                    offset: offset,
+                    payloadSelector: new Qdrant.Client.Grpc.WithPayloadSelector { Enable = true },
+                    vectorsSelector: new Qdrant.Client.Grpc.WithVectorsSelector { Enable = false },
+                    cancellationToken: cancellationToken);
+
+                if (result.Result.Count == 0)
+                    break;
+
+                allPoints.AddRange(result.Result);
+                offset = result.NextPageOffset;
+            } while (offset != null);
+
+            if (allPoints.Count == 0)
+            {
+                System.Console.WriteLine($"[Qdrant] No points found for '{fullFilePath}'");
+                return 0;
+            }
+
+            var pointIds = allPoints
+                .Where(p => p.Id.HasUuid)
+                .Select(p => Guid.Parse(p.Id.Uuid))
+                .ToArray();
+
+            await _client.DeleteAsync(collectionName, pointIds, cancellationToken: cancellationToken);
+
+            System.Console.WriteLine($"[Qdrant] Deleted {pointIds.Length} point(s) for '{fullFilePath}'");
+            return pointIds.Length;
+        }
+        catch (System.Exception ex)
+        {
+            System.Console.WriteLine($"[Qdrant] ERROR during delete by filepath '{fullFilePath}': {ex.Message}");
             throw;
         }
     }

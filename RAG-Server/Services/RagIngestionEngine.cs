@@ -1,19 +1,43 @@
-// RagIngestionEngine.cs
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
-using System.Text.RegularExpressions;
+using RAG_Server.Services;
 
-namespace RAG_Server.Services;
 
 /// <summary>
-/// Orchestrates the full RAG ingestion pipeline: Read -> Check Changes -> Chunk -> Embed -> Store.
-/// NOTE: This class now functions as the central Monitor/Worker service.
+/// Orchestrates the full RAG document ingestion pipeline: read source files, detect changes,
+/// chunk content, generate embeddings, and upsert vectors into Qdrant.
 /// </summary>
+/// <remarks>
+/// <para><strong>Core contract:</strong> This class maintains 100% consistency between the
+/// file system and Qdrant by enforcing a delete-before-rebuild strategy. Every ingestion cycle
+/// performs the following steps:</para>
+/// <list type="number">
+///   <item>Compare current file system state against <see cref="lastKnownMetadata"/> to detect
+///   new, modified, and deleted files.</item>
+///   <item>For <em>deleted files</em> (on disk but not next time): call
+///   <see cref="IVectorStore.DeleteByFilePathAsync"/> to remove ALL historical chunks from Qdrant.</item>
+///   <item>For <em>new/modified files</em>: before upserting, call
+///   <see cref="IVectorStore.DeleteByFilePathAsync"/> to purge any pre-existing chunks for that
+///   file path. This prevents duplicate data — the same source file must never produce multiple
+///   sets of vectors in Qdrant.</item>
+///   <item>Chunk content using 1000-char segments with 100-char overlap, then concurrently
+///   generate embeddings and upsert each chunk with its <c>full_filepath</c> metadata for
+///   later deduplication.</item>
+/// </list>
+/// <para><strong>CRITICAL — Deduplication invariant:</strong> The engine relies on the
+/// <c>full_filepath</c> payload field to identify which Qdrant points belong to which source file.
+/// <see cref="QdrantVectorStore.UpsertVectorAsync"/> and <see cref="QdrantVectorStore.DeleteByFilePathAsync"/>
+/// MUST both use the same <c>full_filepath</c> value (resolved via <see cref="Path.GetFullPath"/>).
+/// Deleting by file path is the ONLY supported mechanism for removing existing chunks before
+/// rebuilding — do not use vector-based deletion (<see cref="QdrantClient.SearchAsync"/>) because
+/// it requires a valid vector dimension (non-zero) which is meaningless for identification-only
+/// operations.</para>
+/// <para><strong>Concurrency:</strong> Uses <see cref="SemaphoreSlim"/> to limit concurrent
+/// embedding/upsert calls (default 5). Each invocation is stateless — it does not persist state
+/// between calls. Callers (e.g. <see cref="DocumentMonitorService"/>) must supply
+/// <see cref="lastKnownMetadata"/> across invocations.</para>
+/// <para><strong>Target stack:</strong> All inference (embeddings + LLM inference) targets
+/// local Ollama. The collection name and embedding dimension are caller-controlled and must
+/// match the Qdrant collection schema.</para>
+/// </remarks>
 public class RagIngestionEngine : IRagIngestionEngine
 {
     private readonly IFileReader _fileReader;
@@ -21,8 +45,9 @@ public class RagIngestionEngine : IRagIngestionEngine
     private readonly IVectorStore _vectorStore;
     private readonly ILogger<RagIngestionEngine> _logger;
 
-    // Constants for chunking
+    /// <summary>Chunk size in characters for text splitting.</summary>
     private const int CHUNK_SIZE = 1000;
+    /// <summary>Overlap in characters between adjacent chunks for context continuity.</summary>
     private const int OVERLAP = 100;
 
     public RagIngestionEngine(IFileReader fileReader, IEmbeddingGenerator embeddingGenerator, IVectorStore vectorStore, ILogger<RagIngestionEngine> logger)
@@ -34,16 +59,28 @@ public class RagIngestionEngine : IRagIngestionEngine
     }
 
     /// <summary>
-    /// Runs the full pipeline to ingest/update documents based on file changes. 
-    /// This method is triggered on explicit API calls or by a background monitor service.
+    /// Runs the full RAG ingestion pipeline: detect file system changes, clean stale Qdrant
+    /// points for deleted files, then read/insert chunks for all new and modified files.
     /// </summary>
-    /// <param name="directoryPath">Local path to the source documents (e.g., Obsidian Vault).</param>
-    /// <param name="collectionName">The name of the Qdrant collection.</param>
-    /// <param name="embeddingDimension">The expected dimension size.</param>
-    /// <param name="maxConcurrentTasks">Concurrency limit.</param>
-    /// <param name="lastKnownMetadata">The state from the previous successful run.</param>
+    /// <param name="directoryPath">The root directory to scan for documents (e.g., Obsidian Vault path).</param>
+    /// <param name="collectionName">The target Qdrant collection name.</param>
+    /// <param name="embeddingDimension">The expected embedding vector dimension (must match the Qdrant collection schema).</param>
+    /// <param name="maxConcurrentTasks">Maximum concurrent embedding + upsert operations.</param>
+    /// <param name="lastKnownMetadata">Previously indexed file metadata from prior runs. If empty or null,
+    /// treated as a first-time full ingest (no deletions are processed). Callers must persist and
+    /// supply this across invocations to enable change tracking.</param>
     /// <param name="cancellationToken">Token for cancellation.</param>
-    /// <returns>Total number of chunks processed and upserted.</returns>
+    /// <returns>Total number of chunks successfully upserted into Qdrant.</returns>
+    /// <remarks>
+    /// <para>If <paramref name="lastKnownMetadata"/> is empty, the method assumes first boot — no
+    /// Qdrant deletions occur, but every file's existing Qdrant chunks are still purged before
+    /// rebuilding (preventing duplicates on initial run against an existing collection).</para>
+    /// <para>Deleted files (present in <paramref name="lastKnownMetadata"/> but missing from disk)
+    /// have their Qdrant points removed before new/modified file chunks are upserted.</para>
+    /// <para>Every file is processed through full deletion-first semantics: before any new chunks
+    /// are written, all prior chunks for that file path are removed from Qdrant. This means no
+    /// file path ever holds more than one set of vectors in the collection at a time.</para>
+    /// </remarks>
     public async Task<int> IngestDocumentsAsync(
         string directoryPath, 
         string collectionName, 
@@ -68,16 +105,32 @@ public class RagIngestionEngine : IRagIngestionEngine
             return 0;
         }
 
-        // 2. Process relevant files
+        // 2. Delete old chunks for files that were deleted from disk
+        var firstScan = lastKnownMetadata == null || lastKnownMetadata.Count == 0;
+        if (!firstScan)
+        {
+            var deletedFilePaths = lastKnownMetadata
+                .Where(m => !changedMetadata.ContainsKey(m.SourceFilePath))
+                .Select(m => m.SourceFilePath)
+                .ToList();
+
+            foreach (var deletedPath in deletedFilePaths)
+            {
+                var fullKey = Path.GetFullPath(deletedPath);
+                int deletedCount = await _vectorStore.DeleteByFilePathAsync(collectionName, fullKey, cancellationToken);
+                _logger.LogInformation($"Deleted {deletedCount} point(s) from Qdrant for removed file: {Path.GetFileName(deletedPath)}");
+            }
+        }
+
+        // 3. Process relevant files
         var filePathsToProcess = changedMetadata.Where(kv => kv.Value.SourceFilePath != null).Select(kv => kv.Key).ToList();
         
         var chunkTasks = new List<Task<int>>();
         var totalProcessedChunkCount = 0;
 
-        // 3. Setup Tasks for Parallel Processing
+        // 4. Setup Tasks for Parallel Processing
         foreach (var filePath in filePathsToProcess)
         {
-            // We queue up tasks for all changed/new files
             chunkTasks.Add(ProcessFileAsync(filePath, collectionName, embeddingDimension, maxConcurrentTasks, cancellationToken));
         }
 
@@ -92,12 +145,31 @@ public class RagIngestionEngine : IRagIngestionEngine
     }
 
     /// <summary>
-    /// Processes a single file: Reads -> Chunks -> Embed -> Store.
+    /// Processes a single source file: purge existing Qdrant chunks, read content, split into
+    /// overlapping segments, generate embeddings, and upsert each chunk.
     /// </summary>
+    /// <remarks>
+    /// <para><strong>De-duplication step occurs here:</strong> Before reading content, calls
+    /// <see cref="IVectorStore.DeleteByFilePathAsync"/> with the file's absolute path. This ensures
+    /// the new chunks upserted in this method replace (not duplicate) any previous set. This is
+    /// the critical step that prevents duplicate data from accumulating in Qdrant across ingestion
+    /// cycles for the same source file.</para>
+    /// <para>Chunking uses 1000-char segments with 100-char overlap for context continuity across
+    /// adjacent chunks. All chunks are processed concurrently (bounded by <c>maxConcurrentTasks</c>).</para>
+    /// </remarks>
     private async Task<int> ProcessFileAsync(string filePath, string collectionName, int embeddingDimension, int maxConcurrentTasks, CancellationToken cancellationToken)
     {
         _logger.LogInformation($"\n--- Processing file: {Path.GetFileName(filePath)} ---");
         
+        var fullPath = Path.GetFullPath(filePath);
+
+        // De-duplicate: purge any existing Qdrant chunks for this file so new ones completely replace old.
+        int deletedCount = await _vectorStore.DeleteByFilePathAsync(collectionName, fullPath, cancellationToken);
+        if (deletedCount > 0)
+        {
+            _logger.LogInformation($"Deleted {deletedCount} existing chunk(s) for '{Path.GetFileName(filePath)}' from Qdrant before rebuilding.");
+        }
+
         // 1. Read Content
         string? fileContent = await _fileReader.ReadFileAsync(filePath, cancellationToken);
         if (string.IsNullOrWhiteSpace(fileContent))

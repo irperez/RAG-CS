@@ -1,0 +1,91 @@
+@page "/ingest"
+@rendermode InteractiveServer
+@inject HttpClient Http
+@inject NavigationManager NavManager
+
+<PageTitle>Ingest Documents</PageTitle>
+
+<h1>Ingest Documents</h1>
+
+<p>Click the button below to manually trigger document ingestion from the configured source path.</p>
+
+<div class="mb-3">
+    <button class="btn btn-primary" @onclick="TriggerIngestion" disabled="@isRunning">
+        @if (isRunning)
+        {
+            <text>
+                <span class="spinner-border spinner-border-sm me-2" role="status"></span>
+                Ingesting...
+            </text>
+        }
+        else
+        {
+            <span>Start Ingestion</span>
+        }
+    </button>
+</div>
+
+@if (resultMessage != null)
+{
+    <div class="alert alert-@resultType" role="alert">
+        @resultMessage
+        @if (chunksProcessed > 0)
+        {
+            <div class="mt-2">
+                <strong>Chunks processed:</strong> @chunksProcessed
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private bool isRunning;
+    private string? resultMessage;
+    private string resultType = "info";
+    private int chunksProcessed;
+
+    private async Task TriggerIngestion()
+    {
+        isRunning = true;
+        resultMessage = null;
+        chunksProcessed = 0;
+
+        try
+        {
+            Uri uri = new(NavManager.ToAbsoluteUri("/api/ingest").ToString());
+            var response = await Http.PostAsync(uri, null);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var result = await response.Content.ReadFromJsonAsync<IngestResult>();
+                if (result != null)
+                {
+                    resultMessage = result.Message;
+                    resultType = "success";
+                    chunksProcessed = result.ChunksProcessed;
+                }
+            }
+            else
+            {
+                resultMessage = $"Ingestion failed with status code {response.StatusCode}.";
+                resultType = "danger";
+            }
+        }
+        catch (Exception ex)
+        {
+            resultMessage = $"Error: {ex.Message}";
+            resultType = "danger";
+        }
+        finally
+        {
+            isRunning = false;
+        }
+    }
+
+    public class IngestResult
+    {
+        public bool Success { get; set; }
+        public string? Message { get; set; }
+        public int ChunksProcessed { get; set; }
+    }
+}
